@@ -163,6 +163,7 @@ import static org.testng.Assert.fail;
 import static org.testng.FileAssert.assertFile;
 
 public class TestHiveIntegrationSmokeTest
+        // TODO extend BaseConnectorTest
         extends AbstractTestIntegrationSmokeTest
 {
     private static final DateTimeFormatter TIMESTAMP_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSSSS");
@@ -2131,6 +2132,113 @@ public class TestHiveIntegrationSmokeTest
     }
 
     @Test
+    public void testCreatePartitionedBucketedTableWithNullsAs()
+    {
+        testCreatePartitionedBucketedTableWithNullsAs(HiveStorageFormat.RCBINARY);
+    }
+
+    private void testCreatePartitionedBucketedTableWithNullsAs(HiveStorageFormat storageFormat)
+    {
+        String tableName = "test_create_partitioned_bucketed_table_with_nulls_as";
+
+        @Language("SQL") String createTable = "" +
+                "CREATE TABLE " + tableName + " " +
+                "WITH (" +
+                "format = '" + storageFormat + "', " +
+                "partitioned_by = ARRAY[ 'orderpriority_nulls', 'orderstatus' ], " +
+                "bucketed_by = ARRAY[ 'custkey', 'orderkey' ], " +
+                "bucket_count = 4 " +
+                ") " +
+                "AS " +
+                "SELECT custkey, orderkey, comment, nullif(orderpriority, '1-URGENT') orderpriority_nulls, orderstatus " +
+                "FROM tpch.tiny.orders";
+
+        assertUpdate(
+                getParallelWriteSession(),
+                createTable,
+                "SELECT count(*) FROM orders");
+
+        // verify that we create bucket_count files in each partition
+        assertEqualsIgnoreOrder(
+                computeActual(format("SELECT orderpriority_nulls, orderstatus, COUNT(DISTINCT \"$path\") FROM %s GROUP BY 1, 2", tableName)),
+                resultBuilder(getSession(), createVarcharType(1), BIGINT)
+                        .row(null, "F", 4L)
+                        .row(null, "O", 4L)
+                        .row(null, "P", 4L)
+                        .row("2-HIGH", "F", 4L)
+                        .row("2-HIGH", "O", 4L)
+                        .row("2-HIGH", "P", 4L)
+                        .row("3-MEDIUM", "F", 4L)
+                        .row("3-MEDIUM", "O", 4L)
+                        .row("3-MEDIUM", "P", 4L)
+                        .row("4-NOT SPECIFIED", "F", 4L)
+                        .row("4-NOT SPECIFIED", "O", 4L)
+                        .row("4-NOT SPECIFIED", "P", 4L)
+                        .row("5-LOW", "F", 4L)
+                        .row("5-LOW", "O", 4L)
+                        .row("5-LOW", "P", 4L)
+                        .build());
+
+        assertQuery("SELECT * FROM " + tableName, "SELECT custkey, orderkey, comment, nullif(orderpriority, '1-URGENT') orderpriority_nulls, orderstatus FROM orders");
+
+        assertUpdate("DROP TABLE " + tableName);
+        assertFalse(getQueryRunner().tableExists(getSession(), tableName));
+    }
+
+    @Test
+    public void testInsertIntoPartitionedBucketedTableFromBucketedTable()
+    {
+        testInsertIntoPartitionedBucketedTableFromBucketedTable(HiveStorageFormat.RCBINARY);
+    }
+
+    private void testInsertIntoPartitionedBucketedTableFromBucketedTable(HiveStorageFormat storageFormat)
+    {
+        String sourceTable = "test_insert_partitioned_bucketed_table_source";
+        String targetTable = "test_insert_partitioned_bucketed_table_target";
+        try {
+            @Language("SQL") String createSourceTable = "" +
+                    "CREATE TABLE " + sourceTable + " " +
+                    "WITH (" +
+                    "format = '" + storageFormat + "', " +
+                    "bucketed_by = ARRAY[ 'custkey' ], " +
+                    "bucket_count = 10 " +
+                    ") " +
+                    "AS " +
+                    "SELECT custkey, comment, orderstatus " +
+                    "FROM tpch.tiny.orders";
+            @Language("SQL") String createTargetTable = "" +
+                    "CREATE TABLE " + targetTable + " " +
+                    "WITH (" +
+                    "format = '" + storageFormat + "', " +
+                    "partitioned_by = ARRAY[ 'orderstatus' ], " +
+                    "bucketed_by = ARRAY[ 'custkey' ], " +
+                    "bucket_count = 10 " +
+                    ") " +
+                    "AS " +
+                    "SELECT custkey, comment, orderstatus " +
+                    "FROM tpch.tiny.orders";
+
+            assertUpdate(getParallelWriteSession(), createSourceTable, "SELECT count(*) FROM orders");
+            assertUpdate(getParallelWriteSession(), createTargetTable, "SELECT count(*) FROM orders");
+
+            transaction(getQueryRunner().getTransactionManager(), getQueryRunner().getAccessControl()).execute(
+                    getParallelWriteSession(),
+                    transactionalSession -> {
+                        assertUpdate(
+                                transactionalSession,
+                                "INSERT INTO " + targetTable + " SELECT * FROM " + sourceTable,
+                                15000,
+                                // there should be two remove exchanges, one below TableWriter and one below TableCommit
+                                assertRemoteExchangesCount(transactionalSession, 2));
+                    });
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + sourceTable);
+            assertUpdate("DROP TABLE IF EXISTS " + targetTable);
+        }
+    }
+
+    @Test
     public void testCreatePartitionedBucketedTableAsWithUnionAll()
     {
         testCreatePartitionedBucketedTableAsWithUnionAll(HiveStorageFormat.RCBINARY);
@@ -2181,6 +2289,15 @@ public class TestHiveIntegrationSmokeTest
         List<?> partitions = getPartitions(tableName);
         assertEquals(partitions.size(), 3);
 
+        // verify that we create bucket_count files in each partition
+        assertEqualsIgnoreOrder(
+                computeActual(format("SELECT orderstatus, COUNT(DISTINCT \"$path\") FROM %s GROUP BY 1", tableName)),
+                resultBuilder(getSession(), createVarcharType(1), BIGINT)
+                        .row("F", 11L)
+                        .row("O", 11L)
+                        .row("P", 11L)
+                        .build());
+
         assertQuery("SELECT * FROM " + tableName, "SELECT custkey, custkey, comment, orderstatus FROM orders");
 
         for (int i = 1; i <= 30; i++) {
@@ -2214,6 +2331,45 @@ public class TestHiveIntegrationSmokeTest
                 .hasMessage("Bucketing columns [c] not present in schema");
 
         assertThatThrownBy(() -> computeActual("" +
+                "CREATE TABLE " + tableName + " (" +
+                "  a BIGINT," +
+                "  b DOUBLE," +
+                "  p VARCHAR" +
+                ") WITH (" +
+                "format = '" + storageFormat + "', " +
+                "partitioned_by = ARRAY[ 'p' ], " +
+                "bucketed_by = ARRAY[ 'a' ], " +
+                "bucket_count = 11, " +
+                "sorted_by = ARRAY[ 'c' ] " +
+                ")"))
+                .hasMessage("Sorting columns [c] not present in schema");
+
+        assertThatThrownBy(() -> computeActual("" +
+                "CREATE TABLE " + tableName + " (" +
+                "  a BIGINT," +
+                "  p VARCHAR" +
+                ") WITH (" +
+                "format = '" + storageFormat + "', " +
+                "partitioned_by = ARRAY[ 'p' ], " +
+                "bucketed_by = ARRAY[ 'p' ], " +
+                "bucket_count = 11 " +
+                ")"))
+                .hasMessage("Bucketing columns [p] are also used as partitioning columns");
+
+        assertThatThrownBy(() -> computeActual("" +
+                "CREATE TABLE " + tableName + " (" +
+                "  a BIGINT," +
+                "  p VARCHAR" +
+                ") WITH (" +
+                "format = '" + storageFormat + "', " +
+                "partitioned_by = ARRAY[ 'p' ], " +
+                "bucketed_by = ARRAY[ 'a' ], " +
+                "bucket_count = 11, " +
+                "sorted_by = ARRAY[ 'p' ] " +
+                ")"))
+                .hasMessage("Sorting columns [p] are also used as partitioning columns");
+
+        assertThatThrownBy(() -> computeActual("" +
                 "CREATE TABLE " + tableName + " " +
                 "WITH (" +
                 "format = '" + storageFormat + "', " +
@@ -2225,6 +2381,20 @@ public class TestHiveIntegrationSmokeTest
                 "SELECT custkey, custkey AS custkey2, comment, orderstatus " +
                 "FROM tpch.tiny.orders"))
                 .hasMessage("Bucketing columns [custkey3] not present in schema");
+
+        assertThatThrownBy(() -> computeActual("" +
+                "CREATE TABLE " + tableName + " " +
+                "WITH (" +
+                "format = '" + storageFormat + "', " +
+                "partitioned_by = ARRAY[ 'orderstatus' ], " +
+                "bucketed_by = ARRAY[ 'custkey' ], " +
+                "bucket_count = 11, " +
+                "sorted_by = ARRAY[ 'custkey3' ] " +
+                ") " +
+                "AS " +
+                "SELECT custkey, custkey AS custkey2, comment, orderstatus " +
+                "FROM tpch.tiny.orders"))
+                .hasMessage("Sorting columns [custkey3] not present in schema");
 
         assertFalse(getQueryRunner().tableExists(getSession(), tableName));
     }
@@ -5520,13 +5690,17 @@ public class TestHiveIntegrationSmokeTest
 
     private Consumer<Plan> assertRemoteExchangesCount(int expectedRemoteExchangesCount)
     {
+        return assertRemoteExchangesCount(getSession(), expectedRemoteExchangesCount);
+    }
+
+    private Consumer<Plan> assertRemoteExchangesCount(Session session, int expectedRemoteExchangesCount)
+    {
         return plan -> {
             int actualRemoteExchangesCount = searchFrom(plan.getRoot())
                     .where(node -> node instanceof ExchangeNode && ((ExchangeNode) node).getScope() == ExchangeNode.Scope.REMOTE)
                     .findAll()
                     .size();
             if (actualRemoteExchangesCount != expectedRemoteExchangesCount) {
-                Session session = getSession();
                 Metadata metadata = getDistributedQueryRunner().getCoordinator().getMetadata();
                 String formattedPlan = textLogicalPlan(plan.getRoot(), plan.getTypes(), metadata, StatsAndCosts.empty(), session, 0, false);
                 throw new AssertionError(format(

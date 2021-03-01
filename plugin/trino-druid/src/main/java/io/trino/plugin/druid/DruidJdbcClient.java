@@ -101,14 +101,15 @@ public class DruidJdbcClient
                 if (tableHandles.isEmpty()) {
                     return Optional.empty();
                 }
+
                 return Optional.of(
                         getOnlyElement(
                                 tableHandles
                                         .stream()
                                         .filter(
                                                 jdbcTableHandle ->
-                                                        Objects.equals(jdbcTableHandle.getSchemaName(), schemaTableName.getSchemaName())
-                                                                && Objects.equals(jdbcTableHandle.getTableName(), schemaTableName.getTableName()))
+                                                        Objects.equals(jdbcTableHandle.getSchemaName(), remoteSchema)
+                                                                && Objects.equals(jdbcTableHandle.getTableName(), remoteTable))
                                         .collect(Collectors.toList())));
             }
         }
@@ -145,9 +146,9 @@ public class DruidJdbcClient
             case Types.VARCHAR:
                 int columnSize = typeHandle.getRequiredColumnSize();
                 if (columnSize == -1) {
-                    return Optional.of(varcharColumnMapping(createUnboundedVarcharType()));
+                    return Optional.of(varcharColumnMapping(createUnboundedVarcharType(), true));
                 }
-                return Optional.of(defaultVarcharColumnMapping(columnSize));
+                return Optional.of(defaultVarcharColumnMapping(columnSize, true));
         }
         // TODO implement proper type mapping
         return legacyToPrestoType(session, connection, typeHandle);

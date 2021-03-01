@@ -176,6 +176,7 @@ import static io.trino.plugin.hive.HiveSessionProperties.isBucketExecutionEnable
 import static io.trino.plugin.hive.HiveSessionProperties.isCollectColumnStatisticsOnWrite;
 import static io.trino.plugin.hive.HiveSessionProperties.isCreateEmptyBucketFiles;
 import static io.trino.plugin.hive.HiveSessionProperties.isOptimizedMismatchedBucketCount;
+import static io.trino.plugin.hive.HiveSessionProperties.isParallelPartitionedBucketedInsert;
 import static io.trino.plugin.hive.HiveSessionProperties.isProjectionPushdownEnabled;
 import static io.trino.plugin.hive.HiveSessionProperties.isRespectTableFormat;
 import static io.trino.plugin.hive.HiveSessionProperties.isSortedWritingEnabled;
@@ -269,7 +270,6 @@ import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.joining;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
-import static java.util.stream.Collectors.toSet;
 import static org.apache.hadoop.hive.metastore.TableType.EXTERNAL_TABLE;
 import static org.apache.hadoop.hive.metastore.TableType.MANAGED_TABLE;
 import static org.apache.hadoop.hive.ql.io.AcidUtils.OrcAcidVersion.writeVersionFile;
@@ -2188,7 +2188,8 @@ public class HiveMetadata
                             bucketing.getColumns().stream()
                                     .map(HiveColumnHandle::getHiveType)
                                     .collect(toImmutableList()),
-                            OptionalInt.empty()),
+                            OptionalInt.empty(),
+                            false),
                     bucketing.getColumns().stream()
                             .map(ColumnHandle.class::cast)
                             .collect(toImmutableList())));
@@ -2346,6 +2347,9 @@ public class HiveMetadata
         HivePartitioningHandle leftHandle = (HivePartitioningHandle) left;
         HivePartitioningHandle rightHandle = (HivePartitioningHandle) right;
 
+        if (leftHandle.isUsePartitionedBucketing() != rightHandle.isUsePartitionedBucketing()) {
+            return Optional.empty();
+        }
         if (!leftHandle.getHiveTypes().equals(rightHandle.getHiveTypes())) {
             return Optional.empty();
         }
@@ -2381,7 +2385,8 @@ public class HiveMetadata
                 leftHandle.getBucketingVersion(), // same as rightHandle.getBucketingVersion()
                 smallerBucketCount,
                 leftHandle.getHiveTypes(),
-                maxCompatibleBucketCount));
+                maxCompatibleBucketCount,
+                false));
     }
 
     private static OptionalInt min(OptionalInt left, OptionalInt right)
@@ -2514,9 +2519,9 @@ public class HiveMetadata
         }
 
         Optional<HiveBucketHandle> hiveBucketHandle = getHiveBucketHandle(session, table, typeManager);
+        List<Column> partitionColumns = table.getPartitionColumns();
         if (hiveBucketHandle.isEmpty()) {
             // return preferred layout which is partitioned by partition columns
-            List<Column> partitionColumns = table.getPartitionColumns();
             if (partitionColumns.isEmpty()) {
                 return Optional.empty();
             }
@@ -2532,17 +2537,23 @@ public class HiveMetadata
             throw new TrinoException(NOT_SUPPORTED, "Writing to bucketed sorted Hive tables is disabled");
         }
 
+        ImmutableList.Builder<String> partitioningColumns = ImmutableList.builder();
+        hiveBucketHandle.get().getColumns().stream()
+                .map(HiveColumnHandle::getName)
+                .forEach(partitioningColumns::add);
+        partitionColumns.stream()
+                .map(Column::getName)
+                .forEach(partitioningColumns::add);
+
         HivePartitioningHandle partitioningHandle = new HivePartitioningHandle(
                 hiveBucketHandle.get().getBucketingVersion(),
                 hiveBucketHandle.get().getTableBucketCount(),
                 hiveBucketHandle.get().getColumns().stream()
                         .map(HiveColumnHandle::getHiveType)
                         .collect(toList()),
-                OptionalInt.of(hiveBucketHandle.get().getTableBucketCount()));
-        List<String> partitionColumns = hiveBucketHandle.get().getColumns().stream()
-                .map(HiveColumnHandle::getName)
-                .collect(toList());
-        return Optional.of(new ConnectorNewTableLayout(partitioningHandle, partitionColumns));
+                OptionalInt.of(hiveBucketHandle.get().getTableBucketCount()),
+                !partitionColumns.isEmpty() && isParallelPartitionedBucketedInsert(session));
+        return Optional.of(new ConnectorNewTableLayout(partitioningHandle, partitioningColumns.build()));
     }
 
     @Override
@@ -2553,9 +2564,9 @@ public class HiveMetadata
         validateBucketColumns(tableMetadata);
         validateColumns(tableMetadata);
         Optional<HiveBucketProperty> bucketProperty = getBucketProperty(tableMetadata.getProperties());
+        List<String> partitionedBy = getPartitionedBy(tableMetadata.getProperties());
         if (bucketProperty.isEmpty()) {
             // return preferred layout which is partitioned by partition columns
-            List<String> partitionedBy = getPartitionedBy(tableMetadata.getProperties());
             if (partitionedBy.isEmpty()) {
                 return Optional.empty();
             }
@@ -2575,9 +2586,13 @@ public class HiveMetadata
                         bucketProperty.get().getBucketCount(),
                         bucketedBy.stream()
                                 .map(hiveTypeMap::get)
-                                .collect(toList()),
-                        OptionalInt.of(bucketProperty.get().getBucketCount())),
-                bucketedBy));
+                                .collect(toImmutableList()),
+                        OptionalInt.of(bucketProperty.get().getBucketCount()),
+                        !partitionedBy.isEmpty()),
+                ImmutableList.<String>builder()
+                        .addAll(bucketedBy)
+                        .addAll(partitionedBy)
+                        .build()));
     }
 
     @Override
@@ -2721,18 +2736,27 @@ public class HiveMetadata
         }
         Set<String> allColumns = tableMetadata.getColumns().stream()
                 .map(ColumnMetadata::getName)
-                .collect(toSet());
+                .collect(toImmutableSet());
 
         List<String> bucketedBy = bucketProperty.get().getBucketedBy();
         if (!allColumns.containsAll(bucketedBy)) {
-            throw new TrinoException(INVALID_TABLE_PROPERTY, format("Bucketing columns %s not present in schema", Sets.difference(ImmutableSet.copyOf(bucketedBy), ImmutableSet.copyOf(allColumns))));
+            throw new TrinoException(INVALID_TABLE_PROPERTY, format("Bucketing columns %s not present in schema", Sets.difference(ImmutableSet.copyOf(bucketedBy), allColumns)));
+        }
+
+        Set<String> partitionColumns = ImmutableSet.copyOf(getPartitionedBy(tableMetadata.getProperties()));
+        if (bucketedBy.stream().anyMatch(partitionColumns::contains)) {
+            throw new TrinoException(INVALID_TABLE_PROPERTY, format("Bucketing columns %s are also used as partitioning columns", Sets.intersection(ImmutableSet.copyOf(bucketedBy), partitionColumns)));
         }
 
         List<String> sortedBy = bucketProperty.get().getSortedBy().stream()
                 .map(SortingColumn::getColumnName)
                 .collect(toImmutableList());
         if (!allColumns.containsAll(sortedBy)) {
-            throw new TrinoException(INVALID_TABLE_PROPERTY, format("Sorting columns %s not present in schema", Sets.difference(ImmutableSet.copyOf(sortedBy), ImmutableSet.copyOf(allColumns))));
+            throw new TrinoException(INVALID_TABLE_PROPERTY, format("Sorting columns %s not present in schema", Sets.difference(ImmutableSet.copyOf(sortedBy), allColumns)));
+        }
+
+        if (sortedBy.stream().anyMatch(partitionColumns::contains)) {
+            throw new TrinoException(INVALID_TABLE_PROPERTY, format("Sorting columns %s are also used as partitioning columns", Sets.intersection(ImmutableSet.copyOf(sortedBy), partitionColumns)));
         }
     }
 

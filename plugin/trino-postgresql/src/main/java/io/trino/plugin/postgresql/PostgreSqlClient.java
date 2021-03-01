@@ -453,14 +453,14 @@ public class PostgreSqlClient
             }
 
             case Types.CHAR:
-                return Optional.of(defaultCharColumnMapping(typeHandle.getRequiredColumnSize()));
+                return Optional.of(defaultCharColumnMapping(typeHandle.getRequiredColumnSize(), true));
 
             case Types.VARCHAR:
                 if (!jdbcTypeName.equals("varchar")) {
                     // This can be e.g. an ENUM
                     return Optional.of(typedVarcharColumnMapping(jdbcTypeName));
                 }
-                return Optional.of(defaultVarcharColumnMapping(typeHandle.getRequiredColumnSize()));
+                return Optional.of(defaultVarcharColumnMapping(typeHandle.getRequiredColumnSize(), true));
 
             case Types.BINARY:
                 return Optional.of(varbinaryColumnMapping());
@@ -750,7 +750,7 @@ public class PostgreSqlClient
     private static ColumnMapping timestampWithTimeZoneColumnMapping(int precision)
     {
         // PostgreSQL supports timestamptz precision up to microseconds
-        checkArgument(precision <= POSTGRESQL_MAX_SUPPORTED_TIMESTAMP_PRECISION, "unsupported precision value %d", precision);
+        checkArgument(precision <= POSTGRESQL_MAX_SUPPORTED_TIMESTAMP_PRECISION, "unsupported precision value %s", precision);
         TimestampWithTimeZoneType prestoType = createTimestampWithTimeZoneType(precision);
         if (precision <= TimestampWithTimeZoneType.MAX_SHORT_PRECISION) {
             return ColumnMapping.longMapping(

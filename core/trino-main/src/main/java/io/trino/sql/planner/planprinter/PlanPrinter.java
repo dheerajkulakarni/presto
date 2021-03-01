@@ -417,7 +417,9 @@ public class PlanPrinter
             }
 
             node.getDistributionType().ifPresent(distributionType -> nodeOutput.appendDetailsLine("Distribution: %s", distributionType));
-            nodeOutput.appendDetailsLine("maySkipOutputDuplicates = %s", node.isMaySkipOutputDuplicates());
+            if (node.isMaySkipOutputDuplicates()) {
+                nodeOutput.appendDetailsLine("maySkipOutputDuplicates = %s", node.isMaySkipOutputDuplicates());
+            }
             if (!node.getDynamicFilters().isEmpty()) {
                 nodeOutput.appendDetails("dynamicFilterAssignments = %s", printDynamicFilterAssignments(node.getDynamicFilters()));
             }
@@ -782,7 +784,7 @@ public class PlanPrinter
                 formatString += "filterPredicate = %s, ";
                 Expression predicate = filterNode.get().getPredicate();
                 DynamicFilters.ExtractResult extractResult = extractDynamicFilters(predicate);
-                arguments.add(combineConjunctsWithDuplicates(extractResult.getStaticConjuncts()));
+                arguments.add(unresolveFunctions(combineConjunctsWithDuplicates(extractResult.getStaticConjuncts())));
                 if (!extractResult.getDynamicConjuncts().isEmpty()) {
                     formatString += "dynamicFilter = %s, ";
                     arguments.add(printDynamicFilters(extractResult.getDynamicConjuncts()));

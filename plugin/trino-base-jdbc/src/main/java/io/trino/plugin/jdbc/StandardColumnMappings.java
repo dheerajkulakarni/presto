@@ -49,7 +49,9 @@ import static com.google.common.io.BaseEncoding.base16;
 import static io.airlift.slice.SliceUtf8.countCodePoints;
 import static io.airlift.slice.Slices.utf8Slice;
 import static io.airlift.slice.Slices.wrappedBuffer;
+import static io.trino.plugin.jdbc.PredicatePushdownController.CASE_INSENSITIVE_CHARACTER_PUSHDOWN;
 import static io.trino.plugin.jdbc.PredicatePushdownController.DISABLE_PUSHDOWN;
+import static io.trino.plugin.jdbc.PredicatePushdownController.FULL_PUSHDOWN;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.CharType.createCharType;
@@ -233,18 +235,19 @@ public final class StandardColumnMappings
         };
     }
 
-    public static ColumnMapping defaultCharColumnMapping(int columnSize)
+    public static ColumnMapping defaultCharColumnMapping(int columnSize, boolean isRemoteCaseSensitive)
     {
         if (columnSize > CharType.MAX_LENGTH) {
-            return defaultVarcharColumnMapping(columnSize);
+            return defaultVarcharColumnMapping(columnSize, isRemoteCaseSensitive);
         }
-        return charColumnMapping(createCharType(columnSize));
+        return charColumnMapping(createCharType(columnSize), isRemoteCaseSensitive);
     }
 
-    public static ColumnMapping charColumnMapping(CharType charType)
+    public static ColumnMapping charColumnMapping(CharType charType, boolean isRemoteCaseSensitive)
     {
         requireNonNull(charType, "charType is null");
-        return ColumnMapping.sliceMapping(charType, charReadFunction(charType), charWriteFunction());
+        PredicatePushdownController pushdownController = isRemoteCaseSensitive ? FULL_PUSHDOWN : CASE_INSENSITIVE_CHARACTER_PUSHDOWN;
+        return ColumnMapping.sliceMapping(charType, charReadFunction(charType), charWriteFunction(), pushdownController);
     }
 
     public static SliceReadFunction charReadFunction(CharType charType)
@@ -264,17 +267,18 @@ public final class StandardColumnMappings
         };
     }
 
-    public static ColumnMapping defaultVarcharColumnMapping(int columnSize)
+    public static ColumnMapping defaultVarcharColumnMapping(int columnSize, boolean isRemoteCaseSensitive)
     {
         if (columnSize > VarcharType.MAX_LENGTH) {
-            return varcharColumnMapping(createUnboundedVarcharType());
+            return varcharColumnMapping(createUnboundedVarcharType(), isRemoteCaseSensitive);
         }
-        return varcharColumnMapping(createVarcharType(columnSize));
+        return varcharColumnMapping(createVarcharType(columnSize), isRemoteCaseSensitive);
     }
 
-    public static ColumnMapping varcharColumnMapping(VarcharType varcharType)
+    public static ColumnMapping varcharColumnMapping(VarcharType varcharType, boolean isRemoteCaseSensitive)
     {
-        return ColumnMapping.sliceMapping(varcharType, varcharReadFunction(varcharType), varcharWriteFunction());
+        PredicatePushdownController pushdownController = isRemoteCaseSensitive ? FULL_PUSHDOWN : CASE_INSENSITIVE_CHARACTER_PUSHDOWN;
+        return ColumnMapping.sliceMapping(varcharType, varcharReadFunction(varcharType), varcharWriteFunction(), pushdownController);
     }
 
     public static SliceReadFunction varcharReadFunction(VarcharType varcharType)
@@ -383,8 +387,7 @@ public final class StandardColumnMappings
     {
         // Time.toLocalTime() does not preserve second fraction
         return sqlTime.toLocalTime()
-                // TODO is the conversion correct if sqlTime.getTime() < 0?
-                .withNano(toIntExact(MILLISECONDS.toNanos(sqlTime.getTime() % 1000)));
+                .withNano(toIntExact(MILLISECONDS.toNanos(floorMod(sqlTime.getTime(), 1000L))));
     }
 
     /**
@@ -434,27 +437,30 @@ public final class StandardColumnMappings
     /**
      * @deprecated This method uses {@link java.sql.Timestamp} and the class cannot represent date-time value when JVM zone had
      * forward offset change (a 'gap'). This includes regular DST changes (e.g. Europe/Warsaw) and one-time policy changes
-     * (Asia/Kathmandu's shift by 15 minutes on January 1, 1986, 00:00:00). If driver only supports {@link LocalDateTime}, use
-     * {@link #timestampColumnMapping} instead.
+     * (Asia/Kathmandu's shift by 15 minutes on January 1, 1986, 00:00:00). This mapping also disables pushdown by default
+     * to ensure correctness because rounding happens within Trino and won't apply to remote system.
+     * If driver supports {@link LocalDateTime}, use {@link #timestampColumnMapping} instead.
      */
     @Deprecated
-    public static ColumnMapping timestampColumnMappingUsingSqlTimestamp(TimestampType timestampType)
+    public static ColumnMapping timestampColumnMappingUsingSqlTimestampWithRounding(TimestampType timestampType)
     {
         // TODO support higher precision
         checkArgument(timestampType.getPrecision() <= TimestampType.MAX_SHORT_PRECISION, "Precision is out of range: %s", timestampType.getPrecision());
         return ColumnMapping.longMapping(
                 timestampType,
                 (resultSet, columnIndex) -> {
-                    Timestamp timestamp = resultSet.getTimestamp(columnIndex);
-                    return toPrestoTimestamp(timestampType, timestamp.toLocalDateTime());
+                    LocalDateTime localDateTime = resultSet.getTimestamp(columnIndex).toLocalDateTime();
+                    int roundedNanos = toIntExact(round(localDateTime.getNano(), 9 - timestampType.getPrecision()));
+                    LocalDateTime rounded = localDateTime
+                            .withNano(0)
+                            .plusNanos(roundedNanos);
+                    return toPrestoTimestamp(timestampType, rounded);
                 },
-                timestampWriteFunctionUsingSqlTimestamp(timestampType));
-    }
-
-    @Deprecated
-    public static ColumnMapping timestampColumnMapping()
-    {
-        return timestampColumnMapping(TIMESTAMP_MILLIS);
+                timestampWriteFunctionUsingSqlTimestamp(timestampType),
+                // NOTE: pushdown is disabled because the values stored in remote system might not match the values as
+                // read by Trino due to rounding. This can lead to incorrect results if operations are pushed down to
+                // the remote system.
+                DISABLE_PUSHDOWN);
     }
 
     public static ColumnMapping timestampColumnMapping(TimestampType timestampType)
@@ -518,12 +524,12 @@ public final class StandardColumnMappings
     {
         long precision = timestampType.getPrecision();
         checkArgument(precision <= TimestampType.MAX_SHORT_PRECISION, "Precision is out of range: %s", precision);
-        Instant instant = localDateTime.atZone(UTC).toInstant();
-        long epochMicros = instant.getEpochSecond() * MICROSECONDS_PER_SECOND + roundDiv(instant.getNano(), NANOSECONDS_PER_MICROSECOND);
+        long epochMicros = localDateTime.toEpochSecond(UTC) * MICROSECONDS_PER_SECOND
+                + localDateTime.getNano() / NANOSECONDS_PER_MICROSECOND;
         verify(
                 epochMicros == round(epochMicros, TimestampType.MAX_SHORT_PRECISION - timestampType.getPrecision()),
                 "Invalid value of epochMicros for precision %s: %s",
-                timestampType.getPrecision(),
+                precision,
                 epochMicros);
         return epochMicros;
     }
@@ -532,13 +538,13 @@ public final class StandardColumnMappings
     {
         long precision = timestampType.getPrecision();
         checkArgument(precision > TimestampType.MAX_SHORT_PRECISION, "Precision is out of range: %s", precision);
-        Instant instant = localDateTime.atZone(UTC).toInstant();
-        long epochMicros = instant.getEpochSecond() * MICROSECONDS_PER_SECOND + floorDiv(instant.getNano(), NANOSECONDS_PER_MICROSECOND);
-        int picosOfMicro = (instant.getNano() % NANOSECONDS_PER_MICROSECOND) * PICOSECONDS_PER_NANOSECOND;
+        long epochMicros = localDateTime.toEpochSecond(UTC) * MICROSECONDS_PER_SECOND
+                + localDateTime.getNano() / NANOSECONDS_PER_MICROSECOND;
+        int picosOfMicro = (localDateTime.getNano() % NANOSECONDS_PER_MICROSECOND) * PICOSECONDS_PER_NANOSECOND;
         verify(
                 picosOfMicro == round(picosOfMicro, TimestampType.MAX_PRECISION - timestampType.getPrecision()),
                 "Invalid value of picosOfMicro for precision %s: %s",
-                timestampType.getPrecision(),
+                precision,
                 picosOfMicro);
         return new LongTimestamp(epochMicros, picosOfMicro);
     }
@@ -609,13 +615,13 @@ public final class StandardColumnMappings
 
             case Types.CHAR:
             case Types.NCHAR:
-                return Optional.of(defaultCharColumnMapping(typeHandle.getRequiredColumnSize()));
+                return Optional.of(defaultCharColumnMapping(typeHandle.getRequiredColumnSize(), false));
 
             case Types.VARCHAR:
             case Types.NVARCHAR:
             case Types.LONGVARCHAR:
             case Types.LONGNVARCHAR:
-                return Optional.of(defaultVarcharColumnMapping(typeHandle.getRequiredColumnSize()));
+                return Optional.of(defaultVarcharColumnMapping(typeHandle.getRequiredColumnSize(), false));
 
             case Types.BINARY:
             case Types.VARBINARY:
@@ -631,7 +637,7 @@ public final class StandardColumnMappings
 
             case Types.TIMESTAMP:
                 // TODO default to `timestampColumnMapping`
-                return Optional.of(timestampColumnMappingUsingSqlTimestamp(TIMESTAMP_MILLIS));
+                return Optional.of(timestampColumnMappingUsingSqlTimestampWithRounding(TIMESTAMP_MILLIS));
         }
         return Optional.empty();
     }
